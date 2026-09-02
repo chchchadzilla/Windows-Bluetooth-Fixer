@@ -1,0 +1,13 @@
+# Normalise line endings; keep Windows script types CRLF so cmd.exe and older PowerShell hosts are happy
+* text=auto
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.cs text eol=crlf
+*.manifest text eol=crlf
+*.md text
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
