@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Draws the repository banner / GitHub social-preview image (1280x640 PNG) with nothing but GDI+.
     Output: assets\banner.png  (also usable as the repo's Social preview image: Settings > General > Social preview)

@@ -1,4 +1,4 @@
-@{
+﻿@{
     # ------------------------------------------------------------------
     # Windows Bluetooth Fixer - Knowledge Base
     # Everything the engine "knows" about Bluetooth hardware on Windows.

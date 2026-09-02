@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Builds BluetoothFixer.exe (elevating launcher) with the .NET Framework C# compiler that ships in Windows.
     Also draws the application icon. Output: ..\BluetoothFixer.exe
