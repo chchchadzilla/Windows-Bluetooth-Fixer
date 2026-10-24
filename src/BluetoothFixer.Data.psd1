@@ -6,7 +6,7 @@
     # and Linux btusb tables; VIDs are authoritative (USB-IF assigned).
     # ------------------------------------------------------------------
 
-    Version = '1.0.1'
+    Version = '1.1.0'
 
     ClassGuids = @{
         Bluetooth = '{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}'
@@ -93,6 +93,7 @@
         'C852' = 'RTL8852CE'
         '8851' = 'RTL8851BE'
         'B851' = 'RTL8851BE'
+        '8922' = 'RTL8922AE (Wi-Fi 7)'
         '4922' = 'RTL8922AE'
     }
 
@@ -108,9 +109,9 @@
             Note  = 'Intel radios need the Intel driver (ibtusb.inf). With only the generic Microsoft driver they usually show up but never work.'
         }
         Realtek  = @{
-            Label = 'Realtek does not publish Bluetooth drivers to the public. Use your PC maker page or the Windows Update Catalog link.'
+            Label = 'Realtek does not publish Bluetooth drivers to the public. Your PC or motherboard maker ships it (Gigabyte, MSI and ASUS list it under WLAN+BT / Bluetooth), or use the Windows Update Catalog link.'
             Url   = 'https://www.realtek.com/Download'
-            Note  = 'Realtek radios need Realtek firmware via the vendor driver (rtkbt / RtkBtfilter). Generic driver = radio present but dead.'
+            Note  = 'Realtek radios need Realtek firmware via the vendor filter driver (rtkbtfilter.inf; shows as "Realtek Bluetooth LEAI Driver" or "Realtek Bluetooth 4.x/5.x Adapter" once installed). Generic driver = radio present but deaf.'
         }
         Qualcomm = @{
             Label = 'Qualcomm / Atheros supplies drivers only to PC makers. Use your PC maker page or the Windows Update Catalog link.'
@@ -142,17 +143,20 @@
     WindowsUpdateCatalogSearch = 'https://www.catalog.update.microsoft.com/Search.aspx?q={0}'
 
     # PC maker support pages. {serial} and {model} are substituted when known.
+    # BoardUrl: the board maker's page for one motherboard model (desktops built on a retail board). {model} = board
+    # product name with spaces turned into hyphens, e.g. "B850 EAGLE WIFI7 ICE" -> B850-EAGLE-WIFI7-ICE.
     OemSupport = @(
         @{ Match = 'Dell|Alienware';          Name = 'Dell';       Url = 'https://www.dell.com/support/home/en-us/product-support/servicetag/{serial}/drivers'; Fallback = 'https://www.dell.com/support/home/en-us?app=drivers'; Tool = 'Dell SupportAssist / Dell Command Update' }
         @{ Match = 'HP|Hewlett';              Name = 'HP';         Url = 'https://support.hp.com/us-en/drivers';                                                Fallback = 'https://support.hp.com/us-en/drivers';               Tool = 'HP Support Assistant' }
         @{ Match = 'LENOVO';                  Name = 'Lenovo';     Url = 'https://pcsupport.lenovo.com/us/en/';                                                 Fallback = 'https://pcsupport.lenovo.com/us/en/';                Tool = 'Lenovo Vantage / System Update' }
         @{ Match = 'ASUS';                    Name = 'ASUS';       Url = 'https://www.asus.com/support/download-center/';                                       Fallback = 'https://www.asus.com/support/';                      Tool = 'MyASUS' }
         @{ Match = 'Acer';                    Name = 'Acer';       Url = 'https://www.acer.com/us-en/support/drivers-and-manuals';                              Fallback = 'https://www.acer.com/us-en/support';                 Tool = 'Acer Care Center' }
-        @{ Match = 'Micro-Star|MSI';          Name = 'MSI';        Url = 'https://www.msi.com/support/download';                                                Fallback = 'https://www.msi.com/support';                        Tool = 'MSI Center' }
+        @{ Match = 'Micro-Star|MSI';          Name = 'MSI';        Url = 'https://www.msi.com/support/download';                                                Fallback = 'https://www.msi.com/support';                        Tool = 'MSI Center'; BoardUrl = 'https://www.msi.com/Motherboard/{model}/support' }
+        @{ Match = 'ASRock';                  Name = 'ASRock';     Url = 'https://www.asrock.com/support/index.asp';                                           Fallback = 'https://www.asrock.com/support/index.asp';           Tool = 'ASRock Live Update & APP Shop' }
         @{ Match = 'Microsoft';               Name = 'Microsoft Surface'; Url = 'https://support.microsoft.com/en-us/surface/download-drivers-and-firmware-for-surface-09bb2e09-2a4b-cb69-0951-078a7739e120'; Fallback = 'https://support.microsoft.com/surface'; Tool = 'Windows Update (Surface drivers ship there)' }
         @{ Match = 'Samsung';                 Name = 'Samsung';    Url = 'https://www.samsung.com/us/support/downloads/';                                       Fallback = 'https://www.samsung.com/us/support/';                Tool = 'Samsung Update' }
         @{ Match = 'Razer';                   Name = 'Razer';      Url = 'https://mysupport.razer.com/';                                                        Fallback = 'https://mysupport.razer.com/';                       Tool = 'Razer Synapse' }
-        @{ Match = 'Gigabyte|AORUS';          Name = 'Gigabyte';   Url = 'https://www.gigabyte.com/Support';                                                    Fallback = 'https://www.gigabyte.com/Support';                   Tool = 'Gigabyte Control Center' }
+        @{ Match = 'Gigabyte|AORUS';          Name = 'Gigabyte';   Url = 'https://www.gigabyte.com/Support';                                                    Fallback = 'https://www.gigabyte.com/Support';                   Tool = 'Gigabyte Control Center'; BoardUrl = 'https://www.gigabyte.com/Motherboard/{model}/support#support-dl-driver-bluetooth' }
         @{ Match = 'TOSHIBA|Dynabook';        Name = 'Dynabook (Toshiba)'; Url = 'https://support.dynabook.com/drivers';                                        Fallback = 'https://support.dynabook.com/';                      Tool = 'Dynabook Service Station' }
         @{ Match = 'LG';                      Name = 'LG';         Url = 'https://www.lg.com/us/support/software-firmware';                                     Fallback = 'https://www.lg.com/us/support';                      Tool = 'LG Update Center' }
         @{ Match = 'HUAWEI';                  Name = 'Huawei';     Url = 'https://consumer.huawei.com/en/support/laptops/';                                     Fallback = 'https://consumer.huawei.com/en/support/';            Tool = 'Huawei PC Manager' }
@@ -204,6 +208,8 @@
     VendorDriverServices = @(
         @{ Name = 'ibtusb';       Vendor = 'Intel';    Note = 'Intel Wireless Bluetooth (ibtusb.sys)' }
         @{ Name = 'RtkBtfilter';  Vendor = 'Realtek';  Note = 'Realtek Bluetooth filter (RtkBtfilter.sys)' }
+        @{ Name = 'RtkBtFilter2'; Vendor = 'Realtek';  Note = 'Realtek Bluetooth filter, 2024+ packages (RtkBtFilter2.sys; RTL8852/8922)' }
+        @{ Name = 'RtkBtManServ'; Vendor = 'Realtek';  Note = 'Realtek Bluetooth Device Manager Service (ships with the filter driver)' }
         @{ Name = 'rtbth';        Vendor = 'Realtek';  Note = 'Realtek Bluetooth (rtbth.sys)' }
         @{ Name = 'BCM43XX';      Vendor = 'Broadcom'; Note = 'Broadcom Bluetooth' }
         @{ Name = 'bcbtums';      Vendor = 'Broadcom'; Note = 'Broadcom Bluetooth USB (bcbtums.sys)' }

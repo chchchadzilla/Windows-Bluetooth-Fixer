@@ -22,7 +22,7 @@ GitHub's link preview (Slack, Discord, X, Teams) uses the repository **Social pr
 ## Cut a release
 
 1. `launcher\build-launcher.ps1` rebuilds `BluetoothFixer.exe` if the launcher source changed.
-2. Bump the version in `src\BluetoothFixer.psm1` (`$script:BFVersion`), `src\BluetoothFixer.Data.psd1` and `CHANGELOG.md`.
+2. Bump the version in `src\BluetoothFixer.psm1` (`$script:BFVersion`), `src\BluetoothFixer.Data.psd1`, `CHANGELOG.md` and the version badge at the top of `README.md`.
 3. Zip the folder without `.git` and attach it to a GitHub Release as `Windows-Bluetooth-Fixer-<version>.zip`.
    Users download the release zip, extract, and double-click `BluetoothFixer.exe`.
 

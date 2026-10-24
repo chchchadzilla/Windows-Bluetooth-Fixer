@@ -19,7 +19,7 @@ $ErrorActionPreference = 'Continue'
 # ---------------------------------------------------------------------------
 $script:BFRoot     = Split-Path -Parent $PSCommandPath
 $script:KB         = Import-PowerShellDataFile -Path (Join-Path $script:BFRoot 'BluetoothFixer.Data.psd1')
-$script:BFVersion  = '1.0.1'
+$script:BFVersion  = '1.1.0'
 $script:BFLog      = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
 $script:BFLogSink  = $null
 $script:BFLogFile  = $null
@@ -230,6 +230,8 @@ function Get-BFEnvironment {
         BIOSVersion    = if ($bios) { $bios.SMBIOSBIOSVersion } else { '' }
         BIOSDate       = if ($bios) { $bios.ReleaseDate } else { $null }
         BaseBoard      = if ($bb) { "$($bb.Manufacturer) $($bb.Product)" } else { '' }
+        BaseBoardMaker = if ($bb) { "$($bb.Manufacturer)" } else { '' }
+        BaseBoardProduct = if ($bb) { "$($bb.Product)" } else { '' }
         IsLaptop       = $isLaptop
         PendingReboot  = ($pending.Count -gt 0)
         PendingReasons = $pending
@@ -335,21 +337,24 @@ function Get-BFDeviceInventory {
         if ($d.InstanceId -match '^(BTH|BTHENUM|BTHLE|BTHLEDEVICE|BTHHFENUM|BTHA2DP)\\') { & $add $d 'Child' }
         else { & $add $d 'Radio' }
     }
-    # 2. USB devices from Bluetooth vendors or with the Bluetooth USB class, in any state (driverless "Unknown device" included)
+    # 2. USB devices that are Bluetooth radios in any state: the Bluetooth USB class (E0/01/01), the Bluetooth device
+    #    class, a bus description that says Bluetooth, or a driverless "Unknown device" from a Bluetooth chip/module vendor.
+    #    A vendor ID alone is NOT enough: Realtek also makes USB NVMe bridges and card readers, Intel makes webcams.
     foreach ($d in ($all | Where-Object { $_.InstanceId -match '^USB\\VID_' })) {
+        if ($seen.ContainsKey($d.InstanceId)) { continue }
         $vp = Get-BFVidPid -Text $d.InstanceId
         $isVendor = ($vp -and ($vids -contains $vp.Vid))
         $isUnknownClass = (-not $d.Class -or $d.Class -in 'Unknown','USB','Bluetooth','')
-        if ($isVendor -or $isUnknownClass) {
-            $rec = New-BFDeviceRecord -Pnp $d -Role 'RadioCandidate' -WifiName $wifiName
-            if (-not $seen.ContainsKey($d.InstanceId)) {
-                if ($rec.IsBluetoothUsbClass -or $rec.Class -eq 'Bluetooth' -or ($isVendor -and ($rec.Vid -in '8087','8086','0BDA','0A12','0CF3','0A5C','0E8D','3574','1131') -or ($isVendor -and $rec.BusDesc -match 'Bluetooth'))) {
-                    if ($rec.Class -eq 'Bluetooth') { $rec.Role = 'Radio' }
-                    $seen[$d.InstanceId] = $true; [void]$records.Add($rec)
-                } elseif ($isVendor -and $rec.Class -in 'Unknown','', $null) {
-                    $seen[$d.InstanceId] = $true; [void]$records.Add($rec)
-                }
-            }
+        if (-not ($isVendor -or $isUnknownClass)) { continue }
+        if ($d.InstanceId -match '&MI_\d\d\\' -and $d.Class -ne 'Bluetooth') { continue }   # interfaces of composite devices (webcam audio/HID)
+        $rec = New-BFDeviceRecord -Pnp $d -Role 'RadioCandidate' -WifiName $wifiName
+        $isRadio = $rec.IsBluetoothUsbClass -or $rec.Class -eq 'Bluetooth' -or ("$($rec.BusDesc)" -match 'Bluetooth')
+        $isDriverlessVendor = $isVendor -and ($rec.Class -in 'Unknown','', $null) -and ($rec.ProblemCode -ne 0 -or -not $rec.InfPath)
+        if ($isRadio) {
+            if ($rec.Class -eq 'Bluetooth') { $rec.Role = 'Radio' }
+            $seen[$d.InstanceId] = $true; [void]$records.Add($rec)
+        } elseif ($isDriverlessVendor) {
+            $seen[$d.InstanceId] = $true; [void]$records.Add($rec)
         }
     }
     # 3. Radios under ACPI/UART (Qualcomm on ARM, some MediaTek) - class Bluetooth handled above; also SWD radio management node
@@ -825,7 +830,7 @@ function Invoke-BFAnalysis {
         } elseif ($r.ProblemCode -eq 28 -or ($r.Class -ne 'Bluetooth' -and $r.ProblemCode -gt 0)) {
             $pk = Find-BFStorePackagesForDevice -Device $r -Store $Store
             $ev2 = $ev + @("Matching packages already in the driver store: " + $(if ($pk.Count) { ($pk | ForEach-Object { "$($_.Published) ($($_.Original) $($_.Version) by $($_.Provider))" }) -join '; ' } else { 'none' }))
-            $fx = @('F08','F09'); if ($pk.Count) { $fx = @('F07') + $fx }
+            $fx = @('F08','F22','F09'); if ($pk.Count) { $fx = @('F07') + $fx }
             & $add (New-BFFinding -Id "RADIO-NODRIVER-$($r.Pid)" -Area 'Driver' -Severity 'Critical' -Title "No driver installed for $($r.ChipName)" -Detail (Get-BFProblemText -Code $r.ProblemCode) -Evidence $ev2 -Fixes $fx)
         } elseif ($r.ProblemCode -eq 31 -or $r.ProblemCode -eq 39 -or $r.ProblemCode -eq 37 -or $r.ProblemCode -eq 52 -or $r.ProblemCode -eq 48) {
             & $add (New-BFFinding -Id "RADIO-DRVLOAD-$($r.Pid)" -Area 'Driver' -Severity 'Critical' -Title "Driver cannot load for $($r.ChipName) (Code $($r.ProblemCode))" -Detail ((Get-BFProblemText -Code $r.ProblemCode) + ' ' + $r.ProblemStatus) -Evidence $ev -Fixes @('F07','F08','F16'))
@@ -844,11 +849,12 @@ function Invoke-BFAnalysis {
             $chip = $r.ChipVendor
             $provider = "$($r.DriverProvider)"
             $needsVendor = $r.NeedsVendorDriver -or ($chip -in 'Intel','Realtek','MediaTek','Qualcomm','Broadcom')
-            if ($needsVendor -and $r.GenericDriverMatch) {
+            $genericInbox = $r.GenericDriverMatch -or ("$($r.InfPath)" -match '^bth\.inf$' -and $provider -match 'Microsoft')
+            if ($needsVendor -and $genericInbox) {
                 $pk = Find-BFStorePackagesForDevice -Device $r -Store $Store
                 $ev2 = $ev + @("Vendor packages in the driver store for this radio: " + $(if ($pk.Count) { ($pk | ForEach-Object { "$($_.Published) ($($_.Original) $($_.Version) by $($_.Provider))" }) -join '; ' } else { 'none' }))
-                $fx = @('F08','F09'); if ($pk.Count) { $fx = @('F07') + $fx }
-                & $add (New-BFFinding -Id "DRV-GENERIC-$($r.Pid)" -Area 'Driver' -Severity 'Critical' -Title "Generic Microsoft driver is installed on a $chip radio" -Detail "The radio matched only on its USB class ($($r.MatchingId)) and is using the inbox 'Generic Bluetooth Radio' driver. $chip radios need the vendor driver to load firmware; with the generic driver they appear in Device Manager but never pair or turn on. Install the $chip driver." -Evidence $ev2 -Fixes $fx)
+                $fx = @('F08','F22','F09'); if ($pk.Count) { $fx = @('F07') + $fx }
+                & $add (New-BFFinding -Id "DRV-GENERIC-$($r.Pid)" -Area 'Driver' -Severity 'Critical' -Title "Generic Microsoft driver is installed on a $chip radio" -Detail "Windows matched the radio only on its USB class ($($r.MatchingId)) and loaded its own 'Generic Bluetooth Adapter' driver ($($r.InfPath)). $chip radios need the vendor's driver to upload their firmware every time they start; with the generic driver the radio shows 'working' in Device Manager and the toggle may even appear, but it never discovers or pairs anything. This is the first thing to fix: get the $chip Bluetooth package from Windows Update or your PC/motherboard maker, install it, then run the discovery test to prove the radio hears devices." -Evidence $ev2 -Fixes $fx)
             }
             $providerVendor = Get-BFChipVendorKey -Vid '' -BusDesc '' -WifiName '' -DriverProvider $provider
             if ($chip -ne 'Unknown' -and $chip -ne 'Module' -and $providerVendor -ne 'Unknown' -and $providerVendor -ne $chip -and $provider -notmatch 'Microsoft') {
@@ -943,7 +949,7 @@ function Invoke-BFAnalysis {
             if ($r.NeedsVendorDriver -and $r.ChipVendor -ne 'Module') {
                 $pk = Find-BFStorePackagesForDevice -Device $r -Store $Store | Where-Object { $_.Provider -notmatch 'Microsoft' }
                 if ($pk.Count -eq 0 -and $vendorPk.Count -eq 0) {
-                    & $add (New-BFFinding -Id "STORE-NOVENDOR-$($r.Pid)" -Area 'Driver' -Severity 'Warning' -Title "No $($r.ChipVendor) Bluetooth package in the driver store" -Detail "Windows has no vendor package that lists $($r.HardwareIds[0]). Fetching it from Windows Update (automatic) or the vendor site puts one in place." -Fixes @('F08','F09'))
+                    & $add (New-BFFinding -Id "STORE-NOVENDOR-$($r.Pid)" -Area 'Driver' -Severity 'Warning' -Title "No $($r.ChipVendor) Bluetooth package in the driver store" -Detail "Windows has no vendor package that lists $($r.HardwareIds[0]). Fetching it from Windows Update (automatic) or the vendor site puts one in place." -Fixes @('F08','F22','F09'))
                 }
             }
         }
@@ -966,6 +972,16 @@ function Invoke-BFAnalysis {
     }
     foreach ($s in $Policy.ThirdPartyStacks) {
         & $add (New-BFFinding -Id "STACK-$($s.Name.GetHashCode())" -Area 'Software' -Severity 'Warning' -Title "Third-party Bluetooth stack installed: $($s.Name)" -Detail "'$($s.Installed)' replaces or patches the Windows Bluetooth stack. On Windows 10/11 these almost always do more harm than good. Uninstall it, then re-run." -Fixes @('F20'))
+    }
+    # Bluetooth software from a different chip vendor than the radio (the Intel package on a Realtek PC, say): harmless, but the wrong download.
+    foreach ($r in $present) {
+        if ($r.ChipVendor -in 'Unknown','Module','CSR','Other') { continue }
+        foreach ($app in $Policy.BluetoothSoftware) {
+            $appVendor = Get-BFChipVendorKey -Vid '' -BusDesc '' -WifiName '' -DriverProvider "$($app.DisplayName) $($app.Publisher)"
+            if ($appVendor -ne 'Unknown' -and $appVendor -ne $r.ChipVendor) {
+                & $add (New-BFFinding -Id "SOFT-WRONGVENDOR-$appVendor" -Area 'Software' -Severity 'Info' -Title "$appVendor Bluetooth software is installed, but your radio is $($r.ChipVendor)" -Detail "'$($app.DisplayName)' $($app.DisplayVersion) only contains drivers for $appVendor radios, so it cannot drive the $($r.ChipName). It does no harm, but it is the wrong download: this PC needs the $($r.ChipVendor) Bluetooth package. You can remove the $appVendor one from Programs and Features." -Evidence @("Installed: $($app.DisplayName) $($app.DisplayVersion) by $($app.Publisher)", "Radio: $($r.ChipName) [$($r.InstanceId)]") -Fixes @('F20'))
+            }
+        }
     }
     if ($Env.FastStartup -and $present.Count -gt 0 -and @($findingList | Where-Object { $_.Severity -eq 'Critical' }).Count -eq 0) {
         & $add (New-BFFinding -Id 'PWR-FASTSTARTUP' -Area 'Power' -Severity 'Info' -Title 'Fast Startup is enabled' -Detail 'Fast Startup keeps the kernel and drivers from the last session. Radios that misbehave "until I restart" are often this. Turning it off costs a few seconds at boot.' -Fixes @('F19'))
@@ -1031,9 +1047,13 @@ function Invoke-BFDiagnosis {
         Findings    = $findings
         Summary     = Get-BFSummary -Findings $findings -Inv $inv -Env $env
         Links       = $null
+        FirstStep   = $null   # Get-BFDriverSituation: the guided "first thing to try"
+        Scan        = $null   # Test-BFDiscovery result, filled in by the GUI/CLI when the test is run
         DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     }
     $diag.Links = Get-BFVendorLinks -Diagnosis $diag
+    $diag.FirstStep = Get-BFDriverSituation -Diagnosis $diag
+    Write-BFLog -Message ("First step: {0} - {1}" -f $diag.FirstStep.Situation, $diag.FirstStep.Headline)
     Report-BFProgress 100 ("Diagnosis finished in {0}s: {1} critical, {2} warnings" -f $diag.DurationSec, @($findings | Where-Object Severity -eq 'Critical').Count, @($findings | Where-Object Severity -eq 'Warning').Count)
     return $diag
 }
@@ -1073,12 +1093,29 @@ function Get-BFVendorLinks {
             if ($d.Extra) { $links += [pscustomobject]@{ Group = 'Chip vendor'; Label = $d.Extra.Label; Url = $d.Extra.Url; Note = '' } }
         }
     }
+    # Desktops built on a retail motherboard: the board maker's page for that exact model is where the Bluetooth driver lives.
+    $boardProduct = "$($env.BaseBoardProduct)".Trim()
+    $boardValid = ($boardProduct -and $boardProduct -notmatch 'Default|To be filled|Base Board|Not Applicable|^\s*$')
+    $boardOem = $null
+    if ($boardValid) { foreach ($o in $kb.OemSupport) { if ("$($env.BaseBoardMaker)" -match $o.Match) { $boardOem = $o; break } } }
+    $boardUrl = $null
+    if ($boardOem -and $boardOem.BoardUrl) { $boardUrl = $boardOem.BoardUrl -replace '\{model\}', (($boardProduct -replace '[^A-Za-z0-9 ._-]', '') -replace '\s+', '-') }
+    $boardNote = 'On a desktop the Bluetooth radio sits on the motherboard''s Wi-Fi card; the board maker ships its driver. Look for the Bluetooth (often "WLAN+BT") entry naming your chip vendor, download it, then use "Install vendor driver from a downloaded package".'
+    $boardLinkUsed = $false
     if ($env.Oem) {
         $u = $env.Oem.Url
         if ($u -match '\{serial\}') { if ($env.Serial -and $env.Serial -notmatch 'Default|To be filled|System Serial|^\s*$') { $u = $u -replace '\{serial\}', [uri]::EscapeDataString($env.Serial) } else { $u = $env.Oem.Fallback } }
-        $links += [pscustomobject]@{ Group = 'PC maker'; Label = "$($env.Oem.Name) drivers for this exact machine ($($env.Model))"; Url = $u; Note = "Their updater tool: $($env.Oem.Tool)" }
+        if ($u -match '\{model\}') { if ($env.Model -and $env.Model -notmatch 'Default|To be filled|System Product|^\s*$') { $u = $u -replace '\{model\}', [uri]::EscapeDataString($env.Model) } else { $u = $env.Oem.Fallback } }
+        $label = "$($env.Oem.Name) drivers for this exact machine ($($env.Model))"; $note = "Their updater tool: $($env.Oem.Tool)"
+        if (-not $env.IsLaptop -and $boardUrl -and $boardOem.Name -eq $env.Oem.Name) { $u = $boardUrl; $label = "$($boardOem.Name) downloads for your motherboard ($boardProduct), Bluetooth section"; $note = $boardNote; $boardLinkUsed = $true }
+        $links += [pscustomobject]@{ Group = 'PC maker'; Label = $label; Url = $u; Note = $note }
     } else {
         $links += [pscustomobject]@{ Group = 'PC maker'; Label = "Search your PC maker's support site for '$($env.Manufacturer) $($env.Model)' drivers"; Url = ('https://www.bing.com/search?q=' + [uri]::EscapeDataString("$($env.Manufacturer) $($env.Model) bluetooth driver download")); Note = '' }
+    }
+    if ($boardValid -and -not $env.IsLaptop -and -not $boardLinkUsed) {
+        $bu = if ($boardUrl) { $boardUrl } else { 'https://www.bing.com/search?q=' + [uri]::EscapeDataString("$($env.BaseBoardMaker) $boardProduct bluetooth driver download") }
+        $bn = if ($boardOem) { $boardOem.Name } else { "$($env.BaseBoardMaker)" }
+        $links += [pscustomobject]@{ Group = 'Motherboard'; Label = "$bn downloads for your motherboard ($boardProduct)"; Url = $bu; Note = $boardNote }
     }
     $hwids = @()
     foreach ($r in $radios) { if ($r.HardwareIds.Count) { $hwids += ($r.HardwareIds[0] -replace '&REV_[0-9A-F]+$', '') } }
@@ -1196,6 +1233,290 @@ function Install-BFDriverForDevice {
 }
 
 # ---------------------------------------------------------------------------
+# The guided "first thing to try": which radio, which driver, can it work?
+# ---------------------------------------------------------------------------
+function Get-BFDriverSituation {
+    <#
+      Looks at the primary present radio and answers one question in plain English: is the driver on it
+      one that can actually drive this chip? Generic Microsoft driver on an Intel/Realtek/MediaTek/Qualcomm/
+      Broadcom radio is the single most common "looks fine, finds nothing" cause, so this is step one.
+    #>
+    param($Diagnosis)
+    $inv = $Diagnosis.Inventory
+    $r = @($inv.PresentRadios | Sort-Object @{ Expression = { if ($_.Class -eq 'Bluetooth') { 0 } else { 1 } } }) | Select-Object -First 1
+    $s = [pscustomobject]@{ Situation = 'NoRadio'; Radio = $r; ChipName = ''; ChipVendor = ''; NeedsVendorDriver = $false; DriverText = ''; Headline = ''; Explanation = ''; Fixes = @(); StorePackages = @(); DownloadLink = $null; CatalogLink = $null; HardwareId = ''; Verified = $false }
+    if (-not $r) {
+        $s.Headline = 'No Bluetooth radio is present right now'
+        $s.Explanation = 'Windows does not see a Bluetooth radio, so there is no driver to check yet. The other findings (USB stack, ghost devices, BIOS) say why; fix those first and run the check again.'
+        $s.Fixes = @('F01', 'F18')
+        return $s
+    }
+    $s.ChipName = $r.ChipName; $s.ChipVendor = $r.ChipVendor
+    $s.NeedsVendorDriver = [bool]($r.NeedsVendorDriver -or ($r.ChipVendor -in 'Intel', 'Realtek', 'MediaTek', 'Qualcomm', 'Broadcom'))
+    $s.HardwareId = (@($r.HardwareIds | Select-Object -First 1) -join '') -replace '&REV_[0-9A-F]+$', ''
+    if (-not $s.HardwareId) { $s.HardwareId = $r.InstanceId -replace '\\[^\\]+$', '' }
+    # vendor packages in the store that list this radio, other than the one already on it
+    $s.StorePackages = @(Find-BFStorePackagesForDevice -Device $r -Store $Diagnosis.DriverStore | Where-Object { $_.Provider -notmatch 'Microsoft' -and $_.Published -ne $r.InfPath })
+    $s.DownloadLink = @($Diagnosis.Links | Where-Object { $_.Group -in 'Motherboard', 'PC maker' -and $_.Url } | Sort-Object @{ Expression = { if ($_.Group -eq 'Motherboard') { 0 } else { 1 } } }) | Select-Object -First 1
+    if ($s.HardwareId) { $s.CatalogLink = @($Diagnosis.Links | Where-Object { $_.Group -eq 'Windows Update Catalog' -and $_.Label -match [regex]::Escape($s.HardwareId) }) | Select-Object -First 1 }
+    $drvName = if ($r.Name -and $r.Name -ne $r.ChipName) { " ('$($r.Name)')" } else { '' }
+    $s.DriverText = "$($r.InfPath) v$($r.DriverVersion) by $($r.DriverProvider)$drvName"
+    $genericInbox = $r.GenericDriverMatch -or ("$($r.InfPath)" -match '^bth\.inf$' -and "$($r.DriverProvider)" -match 'Microsoft')
+    $providerVendor = Get-BFChipVendorKey -Vid '' -BusDesc '' -WifiName '' -DriverProvider "$($r.DriverProvider)"
+    $vendorWord = if ($r.ChipVendor -in 'Unknown', 'Module') { 'the chip vendor' } else { $r.ChipVendor }
+    $pkgFixes = @(); if ($s.StorePackages.Count) { $pkgFixes += 'F07' }; $pkgFixes += 'F08', 'F22', 'F09'
+    if ($r.ProblemCode -eq 28 -or -not $r.InfPath) {
+        $s.Situation = 'NoDriver'
+        $s.Headline = "No driver is installed for your $($r.ChipName)"
+        $s.Explanation = "Windows found the radio but has no driver for it (Code 28), so it sits in Device Manager as an unknown device. Get the $vendorWord Bluetooth package from Windows Update or your PC/motherboard maker and install it."
+        $s.Fixes = $pkgFixes
+    } elseif ($genericInbox -and $s.NeedsVendorDriver) {
+        $s.Situation = 'Generic'
+        $s.Headline = "Windows put its own generic driver on your $($r.ChipVendor) radio"
+        $s.Explanation = "Your Bluetooth radio is a $($r.ChipName). It is running Microsoft's built-in 'Generic Bluetooth Adapter' driver ($($r.InfPath)) because Windows only matched it on its USB class. $($r.ChipVendor) radios need the vendor's driver to upload their firmware every time they start; without it the radio looks healthy in Device Manager, the Bluetooth toggle may even show, but it never hears or pairs anything. Installing the $($r.ChipVendor) Bluetooth package is the fix, and the discovery test afterwards proves it worked."
+        $s.Fixes = $pkgFixes
+    } elseif ($r.ChipVendor -notin 'Unknown', 'Module' -and $providerVendor -ne 'Unknown' -and $providerVendor -ne $r.ChipVendor -and "$($r.DriverProvider)" -notmatch 'Microsoft') {
+        $s.Situation = 'WrongVendor'
+        $s.Headline = "A $providerVendor driver is forced onto your $($r.ChipVendor) radio"
+        $s.Explanation = "The installed driver ($($s.DriverText)) is for $providerVendor chips, but the hardware is a $($r.ChipName). It can only get there through 'Let me pick from a list' with 'Show compatible hardware' unticked. Remove it and install the $($r.ChipVendor) package."
+        $s.Fixes = @('F07', 'F08', 'F22', 'F09')
+    } elseif ($genericInbox) {
+        $s.Situation = 'GenericOk'
+        $s.Verified = $true
+        $s.Headline = 'Your radio uses the Windows built-in driver, and that is fine for this chip'
+        $s.Explanation = "$($r.ChipName) radios carry their own firmware, so Microsoft's inbox driver is the right one for them. Nothing to do here; the next steps test the radio and go through the other findings."
+    } else {
+        $s.Situation = 'Vendor'
+        $s.Verified = $true
+        $s.Headline = "Your radio has its $vendorWord driver"
+        $s.Explanation = "The $($r.ChipName) is running $($s.DriverText). That is the right kind of driver, so the firmware can load. If Bluetooth still misbehaves the cause is elsewhere; the next steps test the radio and go through the other findings."
+    }
+    return $s
+}
+
+# ---------------------------------------------------------------------------
+# Functional test: can the radio hear anything?
+# ---------------------------------------------------------------------------
+function Test-BFDiscovery {
+    <#
+      Runs a real Bluetooth discovery (classic inquiry + LE scan) through the same Windows API that
+      Settings > Add device uses, and reports what the radio heard. A radio whose firmware never loaded
+      (generic driver on an Intel/Realtek/MediaTek chip) shows "working" in Device Manager and still hears
+      nothing, so this is the one check that proves the stack is actually alive.
+    #>
+    [CmdletBinding()]
+    param([int]$TimeoutSec = 45)
+    Write-BFLog -Level STEP -Message "Discovery test: scanning for nearby Bluetooth devices (up to $TimeoutSec s)"
+    $res = [pscustomobject]@{ Ran = $false; TimedOut = $false; Count = 0; Named = 0; Devices = @(); DurationSec = 0; Error = ''; Time = Get-Date }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction Stop
+        $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
+        $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+        # Protocol ids: Bluetooth LE (e0cbf06c...) and Bluetooth classic (bb7bb05e...)
+        $sel = 'System.Devices.Aep.ProtocolId:="{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}" OR System.Devices.Aep.ProtocolId:="{bb7bb05e-5972-42b5-94fc-76eaa7084d49}"'
+        $props = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($pn in 'System.Devices.Aep.DeviceAddress', 'System.Devices.Aep.SignalStrength', 'System.Devices.Aep.IsPaired') { $props.Add($pn) }
+        $op = [Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($sel, $props, [Windows.Devices.Enumeration.DeviceInformationKind]::AssociationEndpoint)
+        $task = $asTask.MakeGenericMethod([Windows.Devices.Enumeration.DeviceInformationCollection]).Invoke($null, @($op))
+        if (-not $task.Wait($TimeoutSec * 1000)) {
+            $res.TimedOut = $true; $res.Ran = $true
+            try { $op.Cancel() } catch { }
+        } else {
+            $list = @()
+            foreach ($di in $task.Result) {
+                $addr = ''; $rssi = $null; $paired = $null
+                foreach ($kv in $di.Properties) {
+                    if ($kv.Key -eq 'System.Devices.Aep.DeviceAddress') { $addr = "$($kv.Value)" }
+                    elseif ($kv.Key -eq 'System.Devices.Aep.SignalStrength') { $rssi = $kv.Value }
+                    elseif ($kv.Key -eq 'System.Devices.Aep.IsPaired') { $paired = $kv.Value }
+                }
+                if ($null -eq $paired) { try { $paired = $di.Pairing.IsPaired } catch { } }
+                $list += [pscustomobject]@{ Name = $(if ($di.Name) { $di.Name } else { '(no name)' }); Address = $addr; Kind = $(if ("$($di.Id)" -match '^BluetoothLE') { 'LE' } else { 'Classic' }); Rssi = $rssi; Paired = [bool]$paired; Id = $di.Id }
+            }
+            $res.Devices = @($list | Sort-Object @{ Expression = { if ($_.Name -eq '(no name)') { 1 } else { 0 } } }, Name)
+            $res.Count = $list.Count
+            $res.Named = @($list | Where-Object { $_.Name -ne '(no name)' }).Count
+            $res.Ran = $true
+        }
+    } catch {
+        $res.Error = $_.Exception.Message
+        if ($_.Exception.InnerException) { $res.Error += ' ' + $_.Exception.InnerException.Message }
+    }
+    $clock.Stop(); $res.DurationSec = [math]::Round($clock.Elapsed.TotalSeconds, 1)
+    if ($res.Error) { Write-BFLog -Level WARN -Message "Discovery test failed: $($res.Error)" }
+    elseif ($res.TimedOut) { Write-BFLog -Level WARN -Message "Discovery test: the radio did not finish a scan within $TimeoutSec s" }
+    else { Write-BFLog -Level $(if ($res.Count) { 'OK' } else { 'WARN' }) -Message ("Discovery test: {0} device(s) heard in {1}s{2}" -f $res.Count, $res.DurationSec, $(if ($res.Count) { ': ' + (($res.Devices | Select-Object -First 8 | ForEach-Object { $_.Name }) -join ', ') } else { '' })) }
+    return $res
+}
+
+# ---------------------------------------------------------------------------
+# Vendor driver packages (the download from the PC / motherboard maker)
+# ---------------------------------------------------------------------------
+function Get-BFSevenZip {
+    $candidates = @()
+    if ($env:ProgramFiles) { $candidates += (Join-Path $env:ProgramFiles '7-Zip\7z.exe') }
+    if (${env:ProgramFiles(x86)}) { $candidates += (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe') }
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+function Expand-BFPackage {
+    <# Unpacks one archive or installer into $Dest. Returns $true when files came out of it. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Dest)
+    New-Item -ItemType Directory -Path $Dest -Force | Out-Null
+    $ext = [IO.Path]::GetExtension($Path).ToLower()
+    $before = @(Get-ChildItem -LiteralPath $Dest -Recurse -File -ErrorAction SilentlyContinue).Count
+    try {
+        switch ($ext) {
+            '.zip' { Expand-Archive -LiteralPath $Path -DestinationPath $Dest -Force -ErrorAction Stop }
+            '.cab' { $o = & (Join-Path $env:SystemRoot 'System32\expand.exe') -F:* $Path $Dest 2>&1 | Out-String; Write-BFLog -Level DEBUG -Message ('expand: ' + ($o -replace '\s+', ' ')) }
+            default {
+                # .exe / .7z / .rar / .msi: 7-Zip opens 7z-SFX installers (what Gigabyte, MSI and ASUS ship) and most other containers
+                $sz = Get-BFSevenZip
+                if (-not $sz) { Write-BFLog -Level WARN -Message "7-Zip is not installed, so $([IO.Path]::GetFileName($Path)) cannot be opened without running it."; return $false }
+                $o = & $sz x -y "-o$Dest" -- $Path 2>&1 | Out-String
+                Write-BFLog -Level DEBUG -Message ('7z: ' + ((($o -split "`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' '))
+            }
+        }
+    } catch { Write-BFLog -Level WARN -Message "Could not unpack $([IO.Path]::GetFileName($Path)): $($_.Exception.Message)"; return $false }
+    $after = @(Get-ChildItem -LiteralPath $Dest -Recurse -File -ErrorAction SilentlyContinue).Count
+    return ($after -gt $before)
+}
+
+function Find-BFInfMatches {
+    <# Every INF under $Root that lists one of the hardware IDs, best first (Bluetooth class, x64, signed, newest). #>
+    param([Parameter(Mandatory)][string]$Root, [string[]]$HardwareIds)
+    $ids = @()
+    foreach ($h in $HardwareIds) { $vp = Get-BFVidPid -Text $h; if ($vp) { $ids += "VID_$($vp.Vid)&PID_$($vp.Pid)" } }
+    $ids = @($ids | Select-Object -Unique)
+    if (-not $ids.Count) { return @() }
+    $hits = @()
+    foreach ($inf in (Get-ChildItem -LiteralPath $Root -Recurse -Filter *.inf -File -ErrorAction SilentlyContinue)) {
+        $text = ''
+        try { $text = [IO.File]::ReadAllText($inf.FullName) } catch { continue }
+        if ($text -notmatch '(?i)\[Version\]') { try { $text = [IO.File]::ReadAllText($inf.FullName, [Text.Encoding]::Unicode) } catch { } }
+        if (-not $text) { continue }
+        $matched = @(); foreach ($id in $ids) { if ($text -match ('(?i)' + [regex]::Escape($id))) { $matched += $id } }
+        if (-not $matched.Count) { continue }
+        $class = ''; if ($text -match '(?im)^\s*Class\s*=\s*([^\s;]+)') { $class = $Matches[1] }
+        $guid = ''; if ($text -match '(?im)^\s*ClassGuid\s*=\s*(\{[0-9A-Fa-f-]+\})') { $guid = $Matches[1] }
+        $prov = ''; if ($text -match '(?im)^\s*Provider\s*=\s*(.+?)\s*$') { $prov = $Matches[1].Trim() }
+        if ($prov -match '^%(.+)%$') { $key = $Matches[1]; if ($text -match ('(?im)^\s*' + [regex]::Escape($key) + '\s*=\s*"?([^"\r\n]+)"?')) { $prov = $Matches[1].Trim() } }
+        $date = ''; $ver = ''; if ($text -match '(?im)^\s*DriverVer\s*=\s*([0-9/]+)\s*,\s*([0-9.]+)') { $date = $Matches[1]; $ver = $Matches[2] }
+        $cat = ''; if ($text -match '(?im)^\s*CatalogFile(?:\.NT\w*)?\s*=\s*([^\s;]+)') { $cat = $Matches[1] }
+        $sig = 'no catalog'
+        if ($cat) {
+            $catPath = Join-Path $inf.DirectoryName $cat
+            if (Test-Path -LiteralPath $catPath) { try { $sig = (Get-AuthenticodeSignature -LiteralPath $catPath).Status.ToString() } catch { $sig = 'unreadable' } } else { $sig = 'catalog missing' }
+        }
+        $isBt = ($class -match '(?i)^Bluetooth$' -or $guid -match '(?i)e0cbf06c')
+        $isExt = ($class -match '(?i)^Extension$')
+        $arch = if ($inf.FullName -match '(?i)\\(x86|i386|win32)\\') { 'x86' } elseif ($inf.FullName -match '(?i)\\(x64|amd64|win64)\\') { 'x64' } else { 'any' }
+        $score = 0
+        if ($isBt) { $score += 100 }
+        if ($arch -eq 'x64') { $score += 30 } elseif ($arch -eq 'any') { $score += 20 }
+        if ($sig -eq 'Valid') { $score += 10 }
+        if ($isExt) { $score -= 50 }
+        $hits += [pscustomobject]@{ Inf = $inf.FullName; File = $inf.Name; Class = $class; ClassGuid = $guid; Provider = $prov; DriverDate = $date; Version = $ver; Catalog = $cat; Signature = $sig; IsBluetooth = $isBt; IsExtension = $isExt; Arch = $arch; Matched = $matched; Score = $score }
+    }
+    return @($hits | Sort-Object @{ Expression = 'Score'; Descending = $true }, @{ Expression = { try { [version]$_.Version } catch { [version]'0.0' } }; Descending = $true })
+}
+
+function Install-BFDriverPackage {
+    <#
+      Installs the vendor Bluetooth driver from a downloaded .zip / .exe / .cab / .inf (or an unpacked folder) onto the radio.
+      Unpacks nested archives (zip -> 7z-SFX exe -> INF is what motherboard makers ship), picks the INF that lists the
+      radio's hardware ID, reports the catalog signature, runs pnputil /add-driver /install, forces the device over if
+      Windows kept the old driver, and verifies which driver the radio runs afterwards.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, $Device, [switch]$DryRun)
+    $res = @{ Success = $false; Skipped = $false; Message = ''; RebootRequired = $false; Inf = ''; Published = ''; Candidates = @(); Before = ''; After = ''; WorkDir = '' }
+    if (-not (Test-Path -LiteralPath $Path)) { $res.Message = "Not found: $Path"; return $res }
+    if (-not $Device) {
+        $live = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -match '^USB\\VID_' -and ($_.Class -eq 'Bluetooth' -or -not $_.Class -or $_.Class -eq 'Unknown') -and $_.InstanceId -notmatch '^(BTH|BTHENUM|BTHLE)\\' })
+        if ($live.Count) { $Device = New-BFDeviceRecord -Pnp $live[0] -Role 'Radio' }
+    }
+    $hwids = @(); if ($Device) { $hwids = @($Device.HardwareIds | Where-Object { $_ }); if (-not $hwids.Count -and $Device.InstanceId) { $hwids = @($Device.InstanceId) } }
+    if (-not $hwids.Count) { $res.Skipped = $true; $res.Message = 'No Bluetooth radio is present to install a driver on. Fix the USB stack / hardware first.'; return $res }
+    $hwid = ($hwids[0] -replace '&REV_[0-9A-F]+$', '')
+    $base = if (Test-BFAdmin) { Join-Path $script:BFDataDir 'Packages' } else { Join-Path $env:TEMP 'BluetoothFixer\Packages' }
+    $work = Join-Path $base (Get-Date -Format 'yyyyMMdd-HHmmss')
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    $res.WorkDir = $work
+    Write-BFLog -Level STEP -Message "Driver package: $Path (radio $hwid), unpacking under $work"
+    $item = Get-Item -LiteralPath $Path
+    if ($item.PSIsContainer) { $root = $item.FullName }
+    elseif ($item.Extension -match '(?i)^\.inf$') { $root = $item.DirectoryName }
+    else {
+        $dst = Join-Path $work ([IO.Path]::GetFileNameWithoutExtension($item.Name))
+        if (-not (Expand-BFPackage -Path $item.FullName -Dest $dst)) {
+            $res.Message = "Could not unpack '$($item.Name)'." + $(if ($item.Extension -match '(?i)^\.(exe|msi)$') { ' It is an installer rather than an archive 7-Zip can open. Run it yourself (right-click > Run as administrator), let it finish, then come back and run the check again.' } else { ' Is it the .zip, .cab or .exe driver package from the maker''s site?' })
+            return $res
+        }
+        $root = $dst
+    }
+    # Packages nest: zip -> exe (7z SFX) -> INF. Unpack inner containers until an INF for this radio shows up (3 levels).
+    for ($level = 0; $level -lt 3; $level++) {
+        if (@(Find-BFInfMatches -Root $root -HardwareIds $hwids).Count) { break }
+        $inner = @(Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '(?i)^\.(zip|cab|exe|7z|msi)$' -and $_.FullName -notmatch '\\_unpacked_\\' -and $_.Length -lt 600MB })
+        if (-not $inner.Count) { break }
+        $any = $false
+        foreach ($a in $inner) {
+            $dst = Join-Path $a.DirectoryName ('_unpacked_\' + [IO.Path]::GetFileNameWithoutExtension($a.Name))
+            if (Test-Path -LiteralPath $dst) { continue }
+            if (Expand-BFPackage -Path $a.FullName -Dest $dst) { $any = $true }
+        }
+        if (-not $any) { break }
+    }
+    $found = @(Find-BFInfMatches -Root $root -HardwareIds $hwids)
+    $res.Candidates = $found
+    if (-not $found.Count) {
+        $allInf = @(Get-ChildItem -LiteralPath $root -Recurse -Filter *.inf -File -ErrorAction SilentlyContinue)
+        $res.Message = "No INF in that package lists your radio ($hwid). " + $(if ($allInf.Count) { "It contains $($allInf.Count) INF file(s) for other hardware (" + (($allInf | Select-Object -First 5 | ForEach-Object { $_.Name }) -join ', ') + '). Check that you downloaded the Bluetooth package, not the Wi-Fi or audio one, for this exact PC or board.' } else { 'It contains no INF files at all. If it is a plain installer, run it yourself and then run the check again.' })
+        return $res
+    }
+    $best = $found[0]
+    $res.Inf = $best.Inf
+    Write-BFLog -Message ("Best match: {0} (class {1}, {2}, v{3} {4}, catalog {5}, {6})" -f $best.Inf, $best.Class, $best.Provider, $best.Version, $best.DriverDate, $best.Signature, $best.Arch)
+    if ($best.Signature -ne 'Valid') { Write-BFLog -Level WARN -Message "Catalog signature is '$($best.Signature)'. 64-bit Windows refuses unsigned kernel drivers; pnputil will say so if that applies." }
+    $before = Get-BFDevProp -InstanceId $Device.InstanceId -Keys 'DEVPKEY_Device_DriverInfPath', 'DEVPKEY_Device_DriverVersion', 'DEVPKEY_Device_DriverProvider'
+    $res.Before = "$($before['DEVPKEY_Device_DriverInfPath']) v$($before['DEVPKEY_Device_DriverVersion']) by $($before['DEVPKEY_Device_DriverProvider'])"
+    if ($DryRun) { $res.Success = $true; $res.Message = "Dry run: would install $($best.File) ($($best.Provider) v$($best.Version), catalog signature $($best.Signature)) onto $hwid. The radio currently runs: $($res.Before)"; return $res }
+    if (-not (Test-BFAdmin)) { $res.Skipped = $true; $res.Message = 'Installing a driver needs administrator rights. Re-launch as administrator.'; return $res }
+    $r = Invoke-BFPnpUtil -Arguments @('/add-driver', $best.Inf, '/install') -TimeoutSec 300
+    $out = ($r.Output -replace '\s+', ' ').Trim()
+    if ($r.Output -match 'Published Name:\s*(\S+)') { $res.Published = $Matches[1] }
+    $onDevice = ($r.Output -match '(?i)installed on device')
+    if ($r.ExitCode -ne 0 -and -not $res.Published) { $res.Message = "pnputil could not add the driver (exit $($r.ExitCode)): $out"; return $res }
+    if ($r.Output -match '(?i)reboot|restart') { $res.RebootRequired = $true }
+    if (-not $onDevice -and $res.Published) {
+        # Staged, but Windows kept the current driver (it ranked it higher). Force the device over.
+        Write-BFLog -Message "Package staged as $($res.Published) but not applied to the radio; forcing it with UpdateDriverForPlugAndPlayDevices"
+        $ir = Install-BFDriverForDevice -HardwareId $hwid -InfPath (Join-Path $env:SystemRoot "INF\$($res.Published)") -Force
+        Write-BFLog -Message $ir.Message
+        if ($ir.RebootRequired) { $res.RebootRequired = $true }
+    }
+    Start-Sleep -Seconds 4
+    $after = Get-BFDevProp -InstanceId $Device.InstanceId -Keys 'DEVPKEY_Device_DriverInfPath', 'DEVPKEY_Device_DriverVersion', 'DEVPKEY_Device_DriverProvider', 'DEVPKEY_Device_ProblemCode'
+    $res.After = "$($after['DEVPKEY_Device_DriverInfPath']) v$($after['DEVPKEY_Device_DriverVersion']) by $($after['DEVPKEY_Device_DriverProvider'])"
+    $switched = ($res.Published -and "$($after['DEVPKEY_Device_DriverInfPath'])" -eq $res.Published) -or ("$($after['DEVPKEY_Device_DriverProvider'])" -notmatch 'Microsoft' -and "$($before['DEVPKEY_Device_DriverProvider'])" -match 'Microsoft')
+    $res.Success = [bool]($onDevice -or $switched)
+    $pc = 0; if ($after.ContainsKey('DEVPKEY_Device_ProblemCode')) { $pc = [int]$after['DEVPKEY_Device_ProblemCode'] }
+    if ($res.Success) {
+        $res.Message = "Installed $($best.File) ($($best.Provider) v$($best.Version)) as $($res.Published). The radio ran $($res.Before); it now runs $($res.After)."
+        if ($pc -ne 0) { $res.Message += " The device reports problem code $pc; a reboot should clear it."; $res.RebootRequired = $true } else { $res.Message += ' Run the discovery test to confirm it hears devices.' }
+    } else {
+        $res.Message = "The package was added to the driver store as $($res.Published), but the radio still runs $($res.After). pnputil said: $out. A reboot usually completes the switch."
+        $res.RebootRequired = $true
+    }
+    return $res
+}
+
+# ---------------------------------------------------------------------------
 # Fix catalog
 # ---------------------------------------------------------------------------
 function Get-BFFixCatalog {
@@ -1221,6 +1542,7 @@ function Get-BFFixCatalog {
         [pscustomobject]@{ Id = 'F19'; Name = 'Turn off Fast Startup';                     Risk = 'Safe';     NeedsAdmin = $true;  Description = 'Sets HiberbootEnabled=0 so every boot is a clean driver initialisation.' }
         [pscustomobject]@{ Id = 'F20'; Name = 'Open Programs and Features';                Risk = 'Safe';     NeedsAdmin = $false; Description = 'To uninstall third-party Bluetooth stacks.' }
         [pscustomobject]@{ Id = 'F21'; Name = 'Re-stage inbox USB hub/xHCI driver from the component store'; Risk = 'Moderate'; NeedsAdmin = $true; Description = 'When Windows Update left ucx01000.sys newer than the installed usbhub3/usbxhci package, imports the matching Microsoft package from WinSxS into the driver store and installs it on the controllers/hubs. Only offered when the mismatch exists. USB devices blink for a few seconds.' }
+        [pscustomobject]@{ Id = 'F22'; Name = 'Install vendor driver from a downloaded package'; Risk = 'Moderate'; NeedsAdmin = $true;  Description = 'Point it at the Bluetooth driver you downloaded from your PC or motherboard maker (.zip, .exe, .cab, .inf or a folder). It unpacks it (nested archives too), finds the INF that lists your radio''s hardware ID, checks the catalog signature, installs it with pnputil and verifies the radio switched to the vendor driver. Backs up first. Needs a file: the GUI asks for it; the CLI takes -DriverPackage.' }
     )
 }
 
@@ -1234,7 +1556,7 @@ function Get-BFRecommendedFixes {
         foreach ($f in ($Diagnosis.Findings | Where-Object Severity -eq $sev)) { foreach ($x in $f.Fixes) { if (-not $ids.Contains($x)) { [void]$ids.Add($x) } } }
     }
     # Sensible execution order: rescan before restarting controllers, services before driver work, reboot last, links last
-    $rank = @{ F10 = 1; F06 = 2; F11 = 3; F12 = 4; F01 = 5; F02 = 6; F21 = 7; F03 = 8; F04 = 9; F05 = 10; F13 = 11; F07 = 12; F08 = 13; F14 = 14; F19 = 15; F16 = 16; F17 = 90; F09 = 95; F18 = 96; F15 = 97; F20 = 98 }
+    $rank = @{ F10 = 1; F06 = 2; F11 = 3; F12 = 4; F01 = 5; F02 = 6; F21 = 7; F03 = 8; F04 = 9; F05 = 10; F13 = 11; F07 = 12; F08 = 13; F22 = 14; F14 = 15; F19 = 16; F16 = 17; F17 = 90; F09 = 95; F18 = 96; F15 = 97; F20 = 98 }
     return @($ids | Sort-Object { if ($rank.ContainsKey($_)) { $rank[$_] } else { 50 } })
 }
 
@@ -1244,7 +1566,7 @@ function Get-BFRecommendedFixes {
 function Invoke-BFFix {
     <# Executes one fix. Returns @{Id; Success; Message; RebootRequired; Skipped}. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$FixId, $Diagnosis, [string]$BackupDir, [switch]$Confirmed)
+    param([Parameter(Mandatory)][string]$FixId, $Diagnosis, [string]$BackupDir, [switch]$Confirmed, [string]$PackagePath)
     $cat = Get-BFFixCatalog | Where-Object Id -eq $FixId
     if (-not $cat) { return @{ Id = $FixId; Success = $false; Message = "Unknown fix $FixId" } }
     $isAdmin = Test-BFAdmin
@@ -1578,6 +1900,14 @@ Radio invisible to Windows - hardware checklist:
                 $res.Message = ($msgs -join ' ') + " Versions now: ucx $($after.Ucx), hub $($after.UsbHub3), xhci $($after.UsbXhci). Root hubs present: $($hubs.Count), with problems: $($bad.Count)."
                 if ($bad.Count -gt 0) { $res.RebootRequired = $true }
             }
+            'F22' {
+                if (-not $PackagePath) { $res.Skipped = $true; $res.Message = 'No driver package was given. Pick the .zip / .exe / .cab / .inf you downloaded (or its folder) and try again.'; break }
+                $target = $null
+                if ($Diagnosis) { $target = @($Diagnosis.Inventory.PresentRadios | Sort-Object @{ Expression = { if ($_.Class -eq 'Bluetooth') { 0 } else { 1 } } }) | Select-Object -First 1 }
+                $ir = Install-BFDriverPackage -Path $PackagePath -Device $target
+                $res.Success = [bool]$ir.Success; $res.Message = $ir.Message; $res.RebootRequired = [bool]$ir.RebootRequired
+                if ($ir.Skipped) { $res.Skipped = $true }
+            }
             default { $res.Message = "Fix $FixId is not implemented." }
         }
     } catch {
@@ -1592,13 +1922,13 @@ Radio invisible to Windows - hardware checklist:
 
 function Invoke-BFFixPlan {
     <# Runs a list of fixes in order with a backup first. Returns results array. #>
-    param([string[]]$FixIds, $Diagnosis, [switch]$ConfirmReboot)
+    param([string[]]$FixIds, $Diagnosis, [switch]$ConfirmReboot, [string]$PackagePath)
     $results = @()
-    $needsBackup = @($FixIds | Where-Object { $_ -in 'F06','F07','F11','F12','F13','F14','F19','F05' }).Count -gt 0
+    $needsBackup = @($FixIds | Where-Object { $_ -in 'F06','F07','F11','F12','F13','F14','F19','F05','F22' }).Count -gt 0
     $backup = $null
     if ($needsBackup -and (Test-BFAdmin)) { try { $backup = New-BFBackup -Diagnosis $Diagnosis } catch { Write-BFLog -Level WARN -Message "Backup failed: $($_.Exception.Message)" } }
     foreach ($id in $FixIds) {
-        $r = Invoke-BFFix -FixId $id -Diagnosis $Diagnosis -BackupDir $backup -Confirmed:$ConfirmReboot
+        $r = Invoke-BFFix -FixId $id -Diagnosis $Diagnosis -BackupDir $backup -Confirmed:$ConfirmReboot -PackagePath $PackagePath
         $results += [pscustomobject]$r
         if ($id -eq 'F17' -and $r.Success) { break }
     }
@@ -1634,6 +1964,17 @@ a{color:#0078d4}
 <div class="card"><div class="verdict" style="color:$(if ($Diagnosis.Summary.CriticalCount) { '#d13438' } else { '#107c10' })">$(& $e $Diagnosis.Summary.Verdict): $(& $e $Diagnosis.Summary.Headline)</div>
 <div class="muted">$($Diagnosis.Summary.CriticalCount) critical &middot; $($Diagnosis.Summary.WarningCount) warnings &middot; radio present: $($Diagnosis.Summary.RadioPresent) $(if ($Diagnosis.Summary.RadioName) { '(' + (& $e $Diagnosis.Summary.RadioName) + ')' }) &middot; Wi-Fi: $(& $e $Diagnosis.Summary.WifiName)</div></div>
 "@)
+    if ($Diagnosis.FirstStep) {
+        $fs = $Diagnosis.FirstStep
+        [void]$sb.Append("<h2>First thing to try</h2><div class='card'><b>$(& $e $fs.Headline)</b><div>$(& $e $fs.Explanation)</div><div class='small muted' style='margin-top:6px'>Radio: $(& $e $fs.ChipName) &middot; driver: $(& $e $fs.DriverText) &middot; hardware ID: $(& $e $fs.HardwareId)</div></div>")
+    }
+    if ($Diagnosis.Scan) {
+        $sc = $Diagnosis.Scan
+        $verdict = if ($sc.Error) { "Scan could not run: $($sc.Error)" } elseif ($sc.TimedOut) { 'The radio did not finish a discovery scan in time.' } elseif ($sc.Count -eq 0) { 'The radio heard nothing nearby.' } else { "The radio heard $($sc.Count) device(s): the stack is alive." }
+        [void]$sb.Append("<h2>Discovery test</h2><div class='card'><b>$(& $e $verdict)</b> <span class='small muted'>($($sc.DurationSec)s, $(& $e ($sc.Time.ToString('g'))))</span>")
+        if ($sc.Count) { [void]$sb.Append('<table><tr><th>Name</th><th>Type</th><th>Paired</th><th>Signal</th><th>Address</th></tr>'); foreach ($dv in $sc.Devices) { [void]$sb.Append("<tr><td>$(& $e $dv.Name)</td><td>$(& $e $dv.Kind)</td><td>$($dv.Paired)</td><td>$(& $e $dv.Rssi)</td><td class='small'>$(& $e $dv.Address)</td></tr>") }; [void]$sb.Append('</table>') }
+        [void]$sb.Append('</div>')
+    }
     [void]$sb.Append('<h2>Findings</h2>')
     foreach ($f in $Diagnosis.Findings) {
         [void]$sb.Append("<div class='card'><span class='pill' style='background:$($sevColor[$f.Severity])'>$($f.Severity)</span><b>$(& $e $f.Title)</b> <span class='muted small'>[$(& $e $f.Area)]</span><div>$(& $e $f.Detail)</div>")
@@ -1671,11 +2012,11 @@ a{color:#0078d4}
     Set-Content -Path $Path -Value $sb.ToString() -Encoding UTF8
     # JSON sidecar
     try {
-        $json = [pscustomobject]@{ Version = $Diagnosis.Version; Time = $Diagnosis.Time; Environment = $Diagnosis.Environment; Summary = $Diagnosis.Summary; Findings = $Diagnosis.Findings; Radios = $Diagnosis.Inventory.Radios; Controllers = $Diagnosis.Inventory.Controllers; RootHubs = $Diagnosis.Inventory.RootHubs; Services = $Diagnosis.Services.Rows; DriverStore = $Diagnosis.DriverStore.BluetoothPackages; Timeline = ($Diagnosis.Timeline | Select-Object -First 200); Links = $Diagnosis.Links; FixResults = $FixResults; Log = (Get-BFLog) }
+        $json = [pscustomobject]@{ Version = $Diagnosis.Version; Time = $Diagnosis.Time; Environment = $Diagnosis.Environment; Summary = $Diagnosis.Summary; Findings = $Diagnosis.Findings; Radios = $Diagnosis.Inventory.Radios; Controllers = $Diagnosis.Inventory.Controllers; RootHubs = $Diagnosis.Inventory.RootHubs; Services = $Diagnosis.Services.Rows; DriverStore = $Diagnosis.DriverStore.BluetoothPackages; Timeline = ($Diagnosis.Timeline | Select-Object -First 200); Links = $Diagnosis.Links; FirstStep = $Diagnosis.FirstStep; Scan = $Diagnosis.Scan; FixResults = $FixResults; Log = (Get-BFLog) }
         $json | ConvertTo-Json -Depth 6 | Set-Content -Path ($Path -replace '\.html$', '.json') -Encoding UTF8
     } catch { Write-BFLog -Level WARN -Message "JSON export failed: $($_.Exception.Message)" }
     Write-BFLog -Level OK -Message "Report saved: $Path"
     return $Path
 }
 
-Export-ModuleMember -Function Set-BFLogSink, Write-BFLog, Get-BFLog, Start-BFLogFile, Test-BFAdmin, Get-BFKB, Get-BFEnvironment, Get-BFDeviceInventory, Get-BFServiceState, Get-BFDriverStore, Get-BFTimeline, Get-BFRadioState, Get-BFPolicyState, Invoke-BFDiagnosis, Get-BFFixCatalog, Get-BFRecommendedFixes, Invoke-BFFix, Invoke-BFFixPlan, Export-BFReport, New-BFBackup, Get-BFVendorLinks, Invoke-BFRescan, Invoke-BFRestartDevice, Install-BFDriverForDevice, Set-BFBluetoothRadioOn, Find-BFStorePackagesForDevice
+Export-ModuleMember -Function Set-BFLogSink, Write-BFLog, Get-BFLog, Start-BFLogFile, Test-BFAdmin, Get-BFKB, Get-BFEnvironment, Get-BFDeviceInventory, Get-BFServiceState, Get-BFDriverStore, Get-BFTimeline, Get-BFRadioState, Get-BFPolicyState, Invoke-BFDiagnosis, Get-BFFixCatalog, Get-BFRecommendedFixes, Invoke-BFFix, Invoke-BFFixPlan, Export-BFReport, New-BFBackup, Get-BFVendorLinks, Invoke-BFRescan, Invoke-BFRestartDevice, Install-BFDriverForDevice, Set-BFBluetoothRadioOn, Find-BFStorePackagesForDevice, Get-BFDriverSituation, Test-BFDiscovery, Install-BFDriverPackage, Find-BFInfMatches, Expand-BFPackage
